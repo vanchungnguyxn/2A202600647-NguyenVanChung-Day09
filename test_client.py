@@ -6,6 +6,7 @@ Sends a legal question to the Customer Agent and prints the response.
 import asyncio
 import os
 import sys
+import time
 
 import httpx
 from dotenv import load_dotenv
@@ -61,7 +62,10 @@ async def main() -> None:
         )
 
         print("Sending request (this may take 30-60s while agents chain)...\n")
+        start_time = time.perf_counter()
         response = await client.send_message(request)
+        latency = time.perf_counter() - start_time
+        print(f"\nLATENCY_SECONDS={latency:.2f}\n")
 
         # Parse response
         result_text = ""

@@ -1,0 +1,140 @@
+--- a/law_agent/graph.py
++++ b/law_agent/graph.py
+@@ -71,47 +71,37 @@
+ async def check_routing(state: LawState) -> dict:
+     """Determine whether tax and/or compliance sub-agents are needed.
+ 
+-    Returns updated state flags so the routing function can read them.
+-    If delegation depth is already at the max, skip further delegation.
++    Optimization: this version uses deterministic keyword routing instead of an
++    extra LLM call. It reduces latency because the Law Agent no longer spends one
++    additional model request only to decide which specialist agents to call.
+     """
+     depth = state.get("delegation_depth", 0)
+     if depth >= MAX_DELEGATION_DEPTH:
+         logger.info("Max delegation depth reached (%d); skipping sub-agents", depth)
+         return {"needs_tax": False, "needs_compliance": False}
+ 
+-    llm = get_llm()
+-    messages = [
+-        SystemMessage(
+-            content=(
+-                'You are a legal routing expert. Based on the question, decide whether '
+-                'specialist sub-agents are needed.\n'
+-                'Reply with ONLY valid JSON — no markdown, no extra text:\n'
+-                '{"needs_tax": <true|false>, "needs_compliance": <true|false>}\n\n'
+-                'needs_tax = true  → question involves tax law, IRS, tax evasion, penalties\n'
+-                'needs_compliance = true → question involves regulatory compliance, SEC, SOX, AML, FCPA'
+-            )
+-        ),
+-        HumanMessage(content=state["question"]),
+-    ]
+-    result = await llm.ainvoke(messages)
+-    raw = result.content.strip()
+-
+-    # Strip markdown code fences if present
+-    if raw.startswith("```"):
+-        raw = raw.split("```")[1]
+-        if raw.startswith("json"):
+-            raw = raw[4:]
+-        raw = raw.strip()
+-
+-    try:
+-        parsed = json.loads(raw)
+-    except json.JSONDecodeError:
+-        logger.warning("Routing LLM returned non-JSON: %r — defaulting to both=True", raw)
+-        parsed = {"needs_tax": True, "needs_compliance": True}
+-
+-    needs_tax = bool(parsed.get("needs_tax", True))
+-    needs_compliance = bool(parsed.get("needs_compliance", True))
+-    logger.info("Routing decision: needs_tax=%s needs_compliance=%s", needs_tax, needs_compliance)
++    question = state["question"].lower()
++
++    tax_keywords = [
++        "tax", "taxes", "irs", "thuế", "tax evasion", "tax avoidance",
++        "back tax", "penalty", "penalties", "fbar", "fatca", "offshore",
++        "income", "revenue", "deduct", "deduction",
++    ]
++    compliance_keywords = [
++        "compliance", "regulatory", "regulation", "sec", "sox", "aml",
++        "fcpa", "audit", "governance", "internal control", "license",
++        "licensing", "reporting",
++    ]
++
++    needs_tax = any(keyword in question for keyword in tax_keywords)
++    needs_compliance = any(keyword in question for keyword in compliance_keywords)
++
++    # Some broad legal questions mention company misconduct but not explicit
++    # compliance keywords. In those cases, keep compliance analysis enabled.
++    if any(keyword in question for keyword in ["company", "corporate", "business"]):
++        needs_compliance = needs_compliance or True
++
++    logger.info("Fast routing decision: needs_tax=%s needs_compliance=%s", needs_tax, needs_compliance)
+     return {"needs_tax": needs_tax, "needs_compliance": needs_compliance}
+ 
+ 
+--- a/tax_agent/graph.py
++++ b/tax_agent/graph.py
+@@ -10,28 +10,21 @@
+ 
+ from common.llm import get_llm
+ 
+-TAX_SYSTEM_PROMPT = """You are a specialist tax attorney and CPA with expertise in:
++TAX_SYSTEM_PROMPT = """You are a specialist tax attorney and CPA.
+ 
+-- Corporate tax law and compliance (federal, state, and international)
+-- Tax evasion vs. tax avoidance — legal distinctions and consequences
+-- IRS enforcement mechanisms, audits, and criminal referrals
+-- Penalties and back-tax calculations under IRC §§ 6651, 6662, 6663
+-- FBAR/FATCA requirements for offshore accounts
+-- Transfer pricing regulations (IRC § 482)
+-- Tax fraud statutes (18 U.S.C. § 7201 – § 7207)
+-- Corporate tax liability: officers, directors, and responsible persons
+-- Voluntary disclosure programs and settlement options
++Your job is to answer ONLY the tax consequences of the user's question.
++Focus on:
++- Tax evasion vs. tax avoidance
++- Civil tax penalties, back taxes, interest, and fraud penalties
++- Criminal exposure for intentional evasion
++- IRS, DOJ Tax Division, FinCEN, FBAR/FATCA issues when relevant
++- Practical mitigation such as voluntary disclosure, corrected filings, and tax counsel
+ 
+-When answering, be precise about:
+-1. Civil vs. criminal penalties and their monetary ranges
+-2. Statute of limitations for tax fraud (6 years for substantial omission,
+-   unlimited for fraudulent returns)
+-3. Which government agencies are involved (IRS, DOJ Tax Division, FinCEN)
+-4. The distinction between the company's liability and individual liability
+-   for executives who directed the evasion
+-
+-Always note that your response is for educational purposes and the user
+-should consult a licensed attorney for specific legal advice.
++Response style:
++- Be concise and structured.
++- Use 3 to 5 bullet points maximum.
++- Do not repeat general contract-law or compliance analysis.
++- End with one short educational disclaimer.
+ """
+ 
+ 
+--- a/test_client.py
++++ b/test_client.py
+@@ -6,6 +6,7 @@
+ import asyncio
+ import os
+ import sys
++import time
+ 
+ import httpx
+ from dotenv import load_dotenv
+@@ -61,7 +62,10 @@
+         )
+ 
+         print("Sending request (this may take 30-60s while agents chain)...\n")
++        start_time = time.perf_counter()
+         response = await client.send_message(request)
++        latency = time.perf_counter() - start_time
++        print(f"\nLATENCY_SECONDS={latency:.2f}\n")
+ 
+         # Parse response
+         result_text = ""
